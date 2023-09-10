@@ -9,52 +9,81 @@ export lookup, insert
 
 # This is a translation of Fig. 3 of "Concurrent Tries with Efficient Non-Blocking Snapshots" by Prokopec et al
 
-# Using an abstract type instead of a union, since
-# julia doesn't have mutually recursive types, xref
-# https://github.com/JuliaLang/julia/issues/269
-abstract type Branch{K,V} end
+
+export Ctrie
+export lookup, insert
+
+#####
+##### Types
+#####
+
+# This is a translation of Fig. 3 of "Concurrent Tries with Efficient Non-Blocking Snapshots" by Prokopec et al
 
 const BITMAP = UInt32
 const W = 5
 
-struct Gen end
+mutable struct Gen end
 
-struct SNode{K,V} <: Branch{K,V}
+mutable struct ParametricINode{M}
+    @atomic main::M
+    const gen::Gen
+end
+
+# This is a combo SNode, TNode, and LNode from the paper
+# here, `kind` tells us which of the three it is
+struct PackedNode{K,V}
+    kind::UInt8
     key::K
     val::V
+    next::Union{Nothing,PackedNode{K,V}}
 end
 
-struct TNode{K,V}
-    sn::SNode{K,V}
+const SNODE_KIND = UInt8(0)
+const TNODE_KIND = UInt8(1)
+const LNODE_KIND = UInt8(2)
+
+# Trick from SumTypes: we want to be able to call constructors like `SNode{K,V}`,
+# so we declare fake types.
+# This is also a footgun since if you dispatch on `::SNode`, it won't match anything.
+struct SNode{K,V} end
+struct TNode{K,V} end
+struct LNode{K,V} end
+
+function SNode{K,V}(key, val) where {K,V}
+    return PackedNode{K,V}(SNODE_KIND, key, val, nothing)
 end
 
-struct LNode{K,V}
-    sn::SNode{K,V}
-    next::Union{Nothing,LNode{K,V}}
+function TNode{K,V}(key, val) where {K,V}
+    return PackedNode{K,V}(TNODE_KIND, key, val, nothing)
 end
 
-# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl,
-# except we allow INode's in the vector too.
+function LNode{K,V}(key, val, next) where {K,V}
+    return PackedNode{K,V}(LNODE_KIND, key, val, next)
+end
+
 struct CNode{K,V}
-    data::Vector{Branch{K,V}}
+    data::Vector{Union{ParametricINode{Union{CNode{K,V},PackedNode{K,V}}},PackedNode{K,V}}}
     bitmap::BITMAP
 end
 
-CNode{K,V}() where {K,V} = CNode(Vector{Branch{K,V}}(undef, 0), zero(BITMAP))
+const INode{K,V} = ParametricINode{Union{CNode{K,V},PackedNode{K,V}}}
 
-MainNode{K,V} = Union{CNode{K,V},TNode{K,V},LNode{K,V}}
+is_inode(x) = x isa INode
+is_cnode(x) = x isa CNode
+is_snode(x) = x.kind == SNODE_KIND
+is_lnode(x) = x.kind == LNODE_KIND
+is_tnode(x) = x.kind == TNODE_KIND
 
-mutable struct INode{K,V} <: Branch{K,V}
-    @atomic main::MainNode{K,V}
-    const gen::Gen
-end
+const Branch{K,V} = Union{INode{K,V},CNode{K,V},PackedNode{K,V}}
+
+const Node{K,V} = Union{INode{K,V},PackedNode{K,V}}
 
 struct Ctrie{K,V}
     root::INode{K,V}
     readonly::Bool
 end
 
-Ctrie{K,V}() where {K,V} = Ctrie{K,V}(INode{K,V}(CNode{K,V}(), Gen()), false)
+Ctrie{K,V}() where {K,V} = Ctrie{K,V}(INode{K,V}(CNode{K,V}(Branch{K,V}[], zero(BITMAP)), Gen()), false)
 Ctrie() = Ctrie{Any,Any}()
 
 #####
@@ -93,17 +122,17 @@ end
 # Fig. 4: lookup operation
 function ilookup(i::INode, key, lev, parent)
     main = i.main
-    if main isa CNode
+    if is_cnode(main)
         cn = main
         flag, pos = flagpos(hash(key), lev, cn.bitmap)
         if cn.bitmap ⊙ flag == 0
             return NOTFOUND
         end
         x = cn.data[pos]
-        if x isa INode
+        if is_inode(x)
             in = x
             return ilookup(in, key, lev + W, i)
-        elseif x isa SNode
+        elseif is_snode(x)
             sn = x
             if sn.key == key
                 return sn.val
@@ -114,11 +143,11 @@ function ilookup(i::INode, key, lev, parent)
             error("unexpected type $(typeof(x))")
         end
         # Uncomment once `clean` is implemented as part of compression
-        # elseif main isa TNode
+        # elseif is_tnode(main)
         # tn = main
         # clean(parent, lev - W)
         # return RESTART
-    elseif main isa LNode
+    elseif is_lnode(main)
         ln = main
         return linked_list_lookup(ln, key)
     else
@@ -126,9 +155,9 @@ function ilookup(i::INode, key, lev, parent)
     end
 end
 
-function linked_list_lookup(ln::LNode, k)
-    if ln.sn.key == k
-        return ln.sn.val
+function linked_list_lookup(ln::Node, k)
+    if ln.key == k
+        return ln.val
     elseif ln.next === nothing
         return NOTFOUND
     else
@@ -152,6 +181,7 @@ end
 # Update `pos` to have this INode
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L559-L565
 function updated(cn::CNode{K,V}, pos, in) where {K,V}
+    @assert is_cnode(cn)
     array = cn.data
     bitmap = cn.bitmap
     narr = copy(array)
@@ -161,7 +191,10 @@ end
 
 # Insert `sn` to `cn` at pos
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L576C1-L585C1
-function inserted(cn::CNode{K,V}, pos, flag, sn::SNode) where {K,V}
+function cnode_inserted(cn::CNode{K,V}, pos, flag, sn) where {K,V}
+    @assert is_cnode(cn)
+    @assert is_snode(sn)
+
     arr = cn.data
     bmp = cn.bitmap | flag
     len = length(arr)
@@ -173,12 +206,15 @@ function inserted(cn::CNode{K,V}, pos, flag, sn::SNode) where {K,V}
     return CNode{K,V}(narr, bmp)
 end
 
-function inserted(ln::LNode{K,V}, k, v) where {K,V}
-    return LNode{K,V}(SNode{K,V}(k, v), ln)
+function lnode_inserted(ln::Node{K,V}, k, v) where {K,V}
+    @assert is_lnode(ln)
+    return LNode{K,V}(k, v, ln)
 end
 
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L656
-function dual(x::SNode{K,V}, xhc::UInt, y::SNode{K,V}, yhc::UInt, lev::Int, gen::Gen) where {K,V}
+function dual(x::Node{K,V}, xhc::UInt, y::Node{K,V}, yhc::UInt, lev::Int, gen::Gen) where {K,V}
+    @assert is_snode(x)
+    @assert is_snode(y)
     if lev < 35 # why 35
         xidx = (xhc >>> UInt32(lev)) & 0x1f
         yidx = (yhc >>> UInt32(lev)) & 0x1f
@@ -196,19 +232,20 @@ function dual(x::SNode{K,V}, xhc::UInt, y::SNode{K,V}, yhc::UInt, lev::Int, gen:
         end
     else
         # Linked list of x and y
-        return LNode{K,V}(x, LNode{K,V}(y, nothing))
+        return LNode{K,V}(x.key, x.val, LNode{K,V}(y.key, y.val, nothing))
     end
 end
 
 # Fig. 6: Insert operation
-function iinsert(i::INode{K,V}, key, val, lev, parent) where {K,V}
+function iinsert(i::Node{K,V}, key, val, lev, parent) where {K,V}
+    @assert is_inode(i)
     n = i.main
     hc = hash(key)
-    if n isa CNode
+    if is_cnode(n)
         cn = n
         flag, pos = flagpos(hc, lev, cn.bitmap)
         if cn.bitmap ⊙ flag == 0
-            ncn = inserted(cn, pos, flag, SNode{K,V}(key, val))
+            ncn = cnode_inserted(cn, pos, flag, SNode{K,V}(key, val))
             _, cas_suceeded = @atomicreplace i.main cn => ncn
             if cas_suceeded
                 return OK
@@ -217,10 +254,10 @@ function iinsert(i::INode{K,V}, key, val, lev, parent) where {K,V}
             end
         end
         x = cn.data[pos]
-        if x isa INode
+        if is_inode(x)
             sin = x
             return iinsert(sin, key, val, lev + W, i)
-        elseif x isa SNode
+        elseif is_snode(x)
             sn = x
             if !isequal(sn.key, key)
                 nsn = SNode{K,V}(key, val)
@@ -247,12 +284,12 @@ function iinsert(i::INode{K,V}, key, val, lev, parent) where {K,V}
             end
         end
         # Uncomment once `clean` is implemented as part of compression
-        # elseif n isa TNode
+        # elseif is_tnode(n)
         # clean(parent, lev - W)
         # return RESTART
-    elseif n isa LNode
+    elseif is_lnode(n)
         ln = n
-        nln = inserted(ln, key, val)
+        nln = lnode_inserted(ln, key, val)
         _, cas_suceeded = @atomicreplace i.main ln => nln
         if cas_suceeded
             return OK
