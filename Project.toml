@@ -3,11 +3,14 @@ uuid = "2285e3c7-dc3e-45f2-994e-342784bd912e"
 authors = ["Eric P. Hanson"]
 version = "1.0.0-DEV"
 
+[deps]
+
 [compat]
 julia = "1.9"
 
 [extras]
+PropCheck = "ca382230-33be-11e9-0059-d981d03070e4"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["PropCheck", "Test"]
