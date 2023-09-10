@@ -35,11 +35,9 @@ struct LNode{K,V}
     next::Union{Nothing,LNode{K,V}}
 end
 
-# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl,
-# except we allow INode's in the vector too.
+# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl
 struct CNode{K,V}
-    # We can't use `MainNode{K,V}` yet since we need CNode which we are defining here.
-    # But we can self-reference CNode, so let's inline the definition manually
+    # We can't use `INode{K,V}` yet, so we manually inline its definition
     data::Vector{Union{SNode{K,V}, ParametricINode{Union{TNode{K,V}, CNode{K,V}, LNode{K,V}}}}}
     bitmap::BITMAP
 end
