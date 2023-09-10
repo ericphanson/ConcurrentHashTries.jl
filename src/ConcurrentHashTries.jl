@@ -31,47 +31,45 @@ end
 
 struct PackedNode{K,V}
     kind::UInt8
-    key::Union{Nothing,K}
-    val::Union{Nothing,V}
+    key::K
+    val::V
     next::Union{Nothing,PackedNode{K,V}}
-    data::Union{Nothing,Vector{Union{ParametricINode{PackedNode{K,V}},PackedNode{K,V}}}}
+end
+
+struct CNode{K,V}
+    data::Vector{Union{ParametricINode{Union{CNode{K,V},PackedNode{K,V}}},PackedNode{K,V}}}
     bitmap::BITMAP
 end
+
 
 const SNODE_KIND = UInt8(0)
 const TNODE_KIND = UInt8(1)
 const LNODE_KIND = UInt8(2)
-const CNODE_KIND = UInt8(3)
 
 struct SNode{K,V} end
 struct TNode{K,V} end
 struct LNode{K,V} end
-struct CNode{K,V} end
 
-function SNode{K,V}(key, val) where {K, V}
-    return PackedNode{K,V}(SNODE_KIND, key, val, nothing, nothing, zero(BITMAP))
+function SNode{K,V}(key, val) where {K,V}
+    return PackedNode{K,V}(SNODE_KIND, key, val, nothing)
 end
 
-function TNode{K,V}(key, val) where {K, V}
-    return PackedNode{K,V}(TNODE_KIND, key, val, nothing, nothing, zero(BITMAP))
+function TNode{K,V}(key, val) where {K,V}
+    return PackedNode{K,V}(TNODE_KIND, key, val, nothing)
 end
 
-function LNode{K,V}(key, val, next) where {K, V}
-    return PackedNode{K,V}(LNODE_KIND, key, val, next, nothing, zero(BITMAP))
+function LNode{K,V}(key, val, next) where {K,V}
+    return PackedNode{K,V}(LNODE_KIND, key, val, next)
 end
 
-function CNode{K,V}(data, bitmap) where {K, V}
-    return PackedNode{K,V}(CNODE_KIND, nothing, nothing, nothing, data, bitmap)
-end
-
-const INode{K,V} = ParametricINode{PackedNode{K,V}}
+const INode{K,V} = ParametricINode{Union{CNode{K,V},PackedNode{K,V}}}
 
 is_inode(x) = x isa INode
 is_snode(x) = x.kind == SNODE_KIND
 is_lnode(x) = x.kind == LNODE_KIND
 is_tnode(x) = x.kind == TNODE_KIND
-is_cnode(x) = x.kind == CNODE_KIND
-const Branch{K,V} = Union{INode{K,V},PackedNode{K,V}}
+is_cnode(x) = x isa CNode
+const Branch{K,V} = Union{INode{K,V},CNode{K,V},PackedNode{K,V}}
 
 const Node{K,V} = Union{INode{K,V},PackedNode{K,V}}
 struct Ctrie{K,V}
@@ -176,7 +174,7 @@ end
 
 # Update `pos` to have this INode
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L559-L565
-function updated(cn::Node{K,V}, pos, in) where {K,V}
+function updated(cn::CNode{K,V}, pos, in) where {K,V}
     @assert is_cnode(cn)
     array = cn.data
     bitmap = cn.bitmap
@@ -187,7 +185,7 @@ end
 
 # Insert `sn` to `cn` at pos
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L576C1-L585C1
-function cnode_inserted(cn::Node{K,V}, pos, flag, sn) where {K,V}
+function cnode_inserted(cn::CNode{K,V}, pos, flag, sn) where {K,V}
     @assert is_cnode(cn)
     @assert is_snode(sn)
 
@@ -204,7 +202,7 @@ end
 
 function lnode_inserted(ln::Node{K,V}, k, v) where {K,V}
     @assert is_lnode(ln)
-    return LNode{K,V}(k,v,ln)
+    return LNode{K,V}(k, v, ln)
 end
 
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L656
