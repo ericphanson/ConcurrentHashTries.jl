@@ -67,8 +67,8 @@ const null = nothing
 const ⊙ = &
 
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L111-L115
-function flagpos(hc, lev, bmp)
-    idx = (hc >>> lev) & 0x1f
+function flagpos(hc::UInt, lev, bmp)
+    idx = (hc >>> UInt32(lev)) & 0x1f
     flag = (UInt32(1) << idx)
     mask = flag - UInt32(1)
     pos = count_ones(bmp & mask) + 1
@@ -180,9 +180,9 @@ end
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L656
 function dual(x::SNode{K,V}, xhc::UInt, y::SNode{K,V}, yhc::UInt, lev::Int, gen::Gen) where {K,V}
     if lev < 35 # why 35
-        xidx = (xhc >>> lev) & 0x1f
-        yidx = (yhc >>> lev) & 0x1f
-        bmp = (1 << xidx) | (1 << yidx)
+        xidx = (xhc >>> UInt32(lev)) & 0x1f
+        yidx = (yhc >>> UInt32(lev)) & 0x1f
+        bmp = (UInt32(1) << xidx) | (UInt32(1) << yidx)
         if xidx == yidx
             mainnode = dual(x, xhc, y, yhc, lev + 5, gen)
             subinode = INode{K,V}(mainnode, gen)
