@@ -3,51 +3,36 @@ module ConcurrentHashTries
 export Ctrie
 export lookup, insert
 
+using SumTypes
+
 #####
 ##### Types
 #####
 
 # This is a translation of Fig. 3 of "Concurrent Tries with Efficient Non-Blocking Snapshots" by Prokopec et al
 
-# Using an abstract type instead of a union, since
-# julia doesn't have mutually recursive types, xref
-# https://github.com/JuliaLang/julia/issues/269
-abstract type Branch{K,V} end
-
 const BITMAP = UInt32
 const W = 5
 
-struct Gen end
+mutable struct Gen end
 
-struct SNode{K,V} <: Branch{K,V}
-    key::K
-    val::V
-end
-
-struct TNode{K,V}
-    sn::SNode{K,V}
-end
-
-struct LNode{K,V}
-    sn::SNode{K,V}
-    next::Union{Nothing,LNode{K,V}}
-end
-
-# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl,
-# except we allow INode's in the vector too.
-struct CNode{K,V}
-    data::Vector{Branch{K,V}}
-    bitmap::BITMAP
-end
-
-CNode{K,V}() where {K,V} = CNode(Vector{Branch{K,V}}(undef, 0), zero(BITMAP))
-
-MainNode{K,V} = Union{CNode{K,V},TNode{K,V},LNode{K,V}}
-
-mutable struct INode{K,V} <: Branch{K,V}
-    @atomic main::MainNode{K,V}
+mutable struct ParametricINode{M}
+    @atomic main::M
     const gen::Gen
 end
+
+@sum_type Node{K,V} begin
+    SNode{K,V}(key::K, val::V)
+    TNode{K,V}(sn::Node{K,V})
+    LNode{K,V}(sn::Node{K,V}, next::Union{Nothing,Node{K,V}})
+    CNode{K,V}(data::Vector{Union{ParametricINode{Node{K,V}},Node{K,V}}}, bitmap::BITMAP)
+end
+
+const INode{K,V} = ParametricINode{Node{K,V}}
+
+const Branch{K,V} = Union{INode{K,V},Node{K,V}}
+
+CNode{K,V}() where {K,V} = CNode(Branch{K,V}[], zero(BITMAP))
 
 struct Ctrie{K,V}
     root::INode{K,V}
@@ -93,46 +78,66 @@ end
 # Fig. 4: lookup operation
 function ilookup(i::INode, key, lev, parent)
     main = i.main
-    if main isa CNode
-        cn = main
-        flag, pos = flagpos(hash(key), lev, cn.bitmap)
-        if cn.bitmap ⊙ flag == 0
-            return NOTFOUND
-        end
-        x = cn.data[pos]
-        if x isa INode
-            in = x
-            return ilookup(in, key, lev + W, i)
-        elseif x isa SNode
-            sn = x
-            if sn.key == key
-                return sn.val
-            else
+    @cases main begin
+        CNode(data, bitmap) => begin
+            cn = main
+            flag, pos = flagpos(hash(key), lev, bitmap)
+            if bitmap ⊙ flag == 0
                 return NOTFOUND
             end
-        else
-            error("unexpected type $(typeof(x))")
+            x = data[pos]
+            if x isa INode
+                in = x
+                return ilookup(in, key, lev + W, i)
+            end
+            @cases x begin
+                SNode(sk, sv) => begin
+                    if sk == key
+                        return sv
+                    else
+                        return NOTFOUND
+                    end
+                end
+                TNode => error("unexpected type $(typeof(x))")
+                LNode => error("unexpected type $(typeof(x))")
+                CNode => error("unexpected type $(typeof(x))")
+            end
         end
         # Uncomment once `clean` is implemented as part of compression
-        # elseif main isa TNode
-        # tn = main
-        # clean(parent, lev - W)
-        # return RESTART
-    elseif main isa LNode
-        ln = main
-        return linked_list_lookup(ln, key)
-    else
-        error("unexpected type $(typeof(main))")
+        TNode => begin
+            tn = main
+            clean(parent, lev - W)
+            return RESTART
+        end
+        LNode => begin
+            ln = main
+            return linked_list_lookup(ln, key)
+        end
+        SNode => error("unexpected $(main)")
     end
 end
 
-function linked_list_lookup(ln::LNode, k)
-    if ln.sn.key == k
-        return ln.sn.val
-    elseif ln.next === nothing
-        return NOTFOUND
-    else
-        linked_list_lookup(ln.next, k)
+function linked_list_lookup(ln::Node, k)
+    @cases ln begin
+        LNode(sn, next) => begin
+            @cases sn begin
+                SNode(key, val) => begin
+                    if key == k
+                        return val
+                    elseif next === nothing
+                        return NOTFOUND
+                    else
+                        linked_list_lookup(next, k)
+                    end
+                end
+                TNode => error()
+                LNode => error()
+                CNode => error()
+            end
+        end
+        TNode => error()
+        SNode => error()
+        CNode => error()
     end
 end
 
@@ -151,34 +156,53 @@ end
 
 # Update `pos` to have this INode
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L559-L565
-function updated(cn::CNode{K,V}, pos, in) where {K,V}
-    array = cn.data
-    bitmap = cn.bitmap
-    narr = copy(array)
-    narr[pos] = in
-    return CNode{K,V}(narr, bitmap)
+function updated(node::Node{K,V}, pos, in) where {K,V}
+    @cases node begin
+        CNode(array, bitmap) => begin
+            narr = copy(array)
+            narr[pos] = in
+            return CNode{K,V}(narr, bitmap)
+        end
+        LNode => error()
+        SNode => error()
+        TNode => error()
+    end
 end
 
 # Insert `sn` to `cn` at pos
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L576C1-L585C1
-function inserted(cn::CNode{K,V}, pos, flag, sn::SNode) where {K,V}
-    arr = cn.data
-    bmp = cn.bitmap | flag
-    len = length(arr)
-    narr = similar(arr, len + 1)
+function cnode_inserted(node::Node{K,V}, pos, flag, sn) where {K,V}
+    @cases node begin
+        CNode(data, bitmap) => begin
+            arr = data
+            bmp = bitmap | flag
+            len = length(arr)
+            narr = similar(arr, len + 1)
 
-    narr[1:(pos-1)] = arr[1:(pos-1)]
-    narr[pos] = sn
-    narr[(pos+1):end] = arr[(pos):end]
-    return CNode{K,V}(narr, bmp)
+            narr[1:(pos-1)] = arr[1:(pos-1)]
+            narr[pos] = sn
+            narr[(pos+1):end] = arr[(pos):end]
+            return CNode{K,V}(narr, bmp)
+        end
+        LNode => error()
+        TNode => error()
+        SNode => error()
+    end
 end
 
-function inserted(ln::LNode{K,V}, k, v) where {K,V}
-    return LNode{K,V}(SNode{K,V}(k, v), ln)
+function lnode_inserted(node::Node{K,V}, k, v) where {K,V}
+    @cases node begin
+        LNode => LNode{K,V}(SNode{K,V}(k, v), node)
+        TNode => error()
+        SNode => error()
+        CNode => error()
+    end
 end
+
+
 
 # https://github.com/scala/scala/blob/0d0d2195d7ea31f44d979748465434283c939e3b/src/library/scala/collection/concurrent/TrieMap.scala#L656
-function dual(x::SNode{K,V}, xhc::UInt, y::SNode{K,V}, yhc::UInt, lev::Int, gen::Gen) where {K,V}
+function dual(x::Node{K,V}, xhc::UInt, y::Node{K,V}, yhc::UInt, lev::Int, gen::Gen) where {K,V}
     if lev < 35 # why 35
         xidx = (xhc >>> UInt32(lev)) & 0x1f
         yidx = (yhc >>> UInt32(lev)) & 0x1f
@@ -196,7 +220,8 @@ function dual(x::SNode{K,V}, xhc::UInt, y::SNode{K,V}, yhc::UInt, lev::Int, gen:
         end
     else
         # Linked list of x and y
-        return LNode{K,V}(x, LNode{K,V}(y, nothing))
+        inner = LNode{K,V}(y, nothing)
+        return LNode{K,V}(x, inner)
     end
 end
 
@@ -204,65 +229,74 @@ end
 function iinsert(i::INode{K,V}, key, val, lev, parent) where {K,V}
     n = i.main
     hc = hash(key)
-    if n isa CNode
-        cn = n
-        flag, pos = flagpos(hc, lev, cn.bitmap)
-        if cn.bitmap ⊙ flag == 0
-            ncn = inserted(cn, pos, flag, SNode{K,V}(key, val))
-            _, cas_suceeded = @atomicreplace i.main cn => ncn
+    @cases n begin
+        CNode(data, bitmap) => begin
+            cn = n
+            flag, pos = flagpos(hc, lev, bitmap)
+            if bitmap ⊙ flag == 0
+                ncn = cnode_inserted(cn, pos, flag, SNode{K,V}(key, val))
+                _, cas_suceeded = @atomicreplace i.main cn => ncn
+                if cas_suceeded
+                    return OK
+                else
+                    return RESTART
+                end
+            end
+            x = data[pos]
+            if x isa INode
+                sin = x
+                return iinsert(sin, key, val, lev + W, i)
+            end
+            @cases x begin
+                LNode => error()
+                TNode => error()
+                CNode => error()
+                SNode(sk, sv) => begin
+                    sn = x
+                    if !isequal(sk, key)
+                        nsn = SNode{K,V}(key, val)
+
+                        # TODO: which gen
+                        gen = Gen()
+                        inner_c = dual(sn, hash(sk), nsn, hc, lev + 5, gen)
+                        nin = INode{K,V}(inner_c, gen)
+                        ncn = updated(cn, pos, nin)
+                        _, cas_suceeded = @atomicreplace i.main cn => ncn
+                        if cas_suceeded
+                            return OK
+                        else
+                            return RESTART
+                        end
+                    else
+                        ncn = updated(cn, pos, SNode{K,V}(key, val))
+                        _, cas_suceeded = @atomicreplace i.main cn => ncn
+                        if cas_suceeded
+                            return OK
+                        else
+                            return RESTART
+                        end
+                    end
+                end
+
+            end
+        end
+        # Will error once `clean` is implemented as part of compression
+        TNode => begin
+            clean(parent, lev - W)
+            return RESTART
+        end
+        LNode => begin
+            ln = n
+            nln = lnode_inserted(ln, key, val)
+            _, cas_suceeded = @atomicreplace i.main ln => nln
             if cas_suceeded
                 return OK
             else
                 return RESTART
             end
         end
-        x = cn.data[pos]
-        if x isa INode
-            sin = x
-            return iinsert(sin, key, val, lev + W, i)
-        elseif x isa SNode
-            sn = x
-            if !isequal(sn.key, key)
-                nsn = SNode{K,V}(key, val)
-
-                # TODO: which gen
-                gen = Gen()
-                inner_c = dual(sn, hash(sn.key), nsn, hc, lev + 5, gen)
-                nin = INode{K,V}(inner_c, gen)
-                ncn = updated(cn, pos, nin)
-                _, cas_suceeded = @atomicreplace i.main cn => ncn
-                if cas_suceeded
-                    return OK
-                else
-                    return RESTART
-                end
-            else
-                ncn = updated(cn, pos, SNode{K,V}(key, val))
-                _, cas_suceeded = @atomicreplace i.main cn => ncn
-                if cas_suceeded
-                    return OK
-                else
-                    return RESTART
-                end
-            end
-        end
-        # Uncomment once `clean` is implemented as part of compression
-        # elseif n isa TNode
-        # clean(parent, lev - W)
-        # return RESTART
-    elseif n isa LNode
-        ln = n
-        nln = inserted(ln, key, val)
-        _, cas_suceeded = @atomicreplace i.main ln => nln
-        if cas_suceeded
-            return OK
-        else
-            return RESTART
-        end
-    else
-        error("unexpected type $(typeof(n))")
+        SNode => error("Did not expect SNode here")
     end
-
 end
 
 end # module
