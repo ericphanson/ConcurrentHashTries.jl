@@ -29,6 +29,8 @@ mutable struct ParametricINode{M}
     const gen::Gen
 end
 
+# This is a combo SNode, TNode, and LNode from the paper
+# here, `kind` tells us which of the three it is
 struct PackedNode{K,V}
     kind::UInt8
     key::K
@@ -36,16 +38,13 @@ struct PackedNode{K,V}
     next::Union{Nothing,PackedNode{K,V}}
 end
 
-struct CNode{K,V}
-    data::Vector{Union{ParametricINode{Union{CNode{K,V},PackedNode{K,V}}},PackedNode{K,V}}}
-    bitmap::BITMAP
-end
-
-
 const SNODE_KIND = UInt8(0)
 const TNODE_KIND = UInt8(1)
 const LNODE_KIND = UInt8(2)
 
+# Trick from SumTypes: we want to be able to call constructors like `SNode{K,V}`,
+# so we declare fake types.
+# This is also a footgun since if you dispatch on `::SNode`, it won't match anything.
 struct SNode{K,V} end
 struct TNode{K,V} end
 struct LNode{K,V} end
@@ -62,16 +61,23 @@ function LNode{K,V}(key, val, next) where {K,V}
     return PackedNode{K,V}(LNODE_KIND, key, val, next)
 end
 
+struct CNode{K,V}
+    data::Vector{Union{ParametricINode{Union{CNode{K,V},PackedNode{K,V}}},PackedNode{K,V}}}
+    bitmap::BITMAP
+end
+
 const INode{K,V} = ParametricINode{Union{CNode{K,V},PackedNode{K,V}}}
 
 is_inode(x) = x isa INode
+is_cnode(x) = x isa CNode
 is_snode(x) = x.kind == SNODE_KIND
 is_lnode(x) = x.kind == LNODE_KIND
 is_tnode(x) = x.kind == TNODE_KIND
-is_cnode(x) = x isa CNode
+
 const Branch{K,V} = Union{INode{K,V},CNode{K,V},PackedNode{K,V}}
 
 const Node{K,V} = Union{INode{K,V},PackedNode{K,V}}
+
 struct Ctrie{K,V}
     root::INode{K,V}
     readonly::Bool
