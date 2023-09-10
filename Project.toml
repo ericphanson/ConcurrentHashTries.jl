@@ -4,6 +4,7 @@ authors = ["Eric P. Hanson"]
 version = "1.0.0-DEV"
 
 [deps]
+SumTypes = "8e1ec7a9-0e02-4297-b0fe-6433085c89f2"
 
 [compat]
 julia = "1.9"
