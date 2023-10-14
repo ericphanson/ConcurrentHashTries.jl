@@ -9,17 +9,19 @@ export lookup, insert
 
 # This is a translation of Fig. 3 of "Concurrent Tries with Efficient Non-Blocking Snapshots" by Prokopec et al
 
-# Using an abstract type instead of a union, since
-# julia doesn't have mutually recursive types, xref
-# https://github.com/JuliaLang/julia/issues/269
-abstract type Branch{K,V} end
-
 const BITMAP = UInt32
 const W = 5
 
 struct Gen end
 
-struct SNode{K,V} <: Branch{K,V}
+mutable struct ParametricINode{M}
+    # We can't use `MainNode{K,V}` yet since we don't have the other types defined yet.
+    # Leave parametric for now.
+    @atomic main::M
+    const gen::Gen
+end
+
+struct SNode{K,V}
     key::K
     val::V
 end
@@ -33,21 +35,23 @@ struct LNode{K,V}
     next::Union{Nothing,LNode{K,V}}
 end
 
-# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl,
-# except we allow INode's in the vector too.
+# This is analogous to HMAT{K,V} from https://github.com/vchuravy/HashArrayMappedTries.jl
 struct CNode{K,V}
-    data::Vector{Branch{K,V}}
+    # We can't use `INode{K,V}` yet, so we manually inline its definition
+    data::Vector{Union{SNode{K,V}, ParametricINode{Union{TNode{K,V}, CNode{K,V}, LNode{K,V}}}}}
     bitmap::BITMAP
 end
 
-CNode{K,V}() where {K,V} = CNode(Vector{Branch{K,V}}(undef, 0), zero(BITMAP))
-
+# Now we can finally define our MainNode
 MainNode{K,V} = Union{CNode{K,V},TNode{K,V},LNode{K,V}}
 
-mutable struct INode{K,V} <: Branch{K,V}
-    @atomic main::MainNode{K,V}
-    const gen::Gen
-end
+# And use it to define proper INode's
+INode{K,V} = ParametricINode{MainNode{K,V}}
+
+Branch{K,V} = Union{INode{K,V}, SNode{K,V}}
+
+CNode{K,V}() where {K,V} = CNode(Vector{Branch{K,V}}(undef, 0), zero(BITMAP))
+
 
 struct Ctrie{K,V}
     root::INode{K,V}
